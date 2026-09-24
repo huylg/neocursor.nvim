@@ -277,5 +277,36 @@ vim.cmd("setlocal undolevels<")
 later(50, round7)
 feed("A0") -- inline ghost, same prefix as round 5
 
+-- Round 8: an insert that begins past the last line. It used to render above
+-- that line (virt_lines_above after the anchor was clamped), and <Tab> jumped
+-- at a row that does not exist, so the accept never ran.
+local function round8()
+  poll(nc.has_suggestion, 5000, function()
+    local placed
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(0, preview.namespace(), 0, -1, { details = true })) do
+      local vl = m[4].virt_lines
+      if vl then
+        placed = { row = m[2], above = m[4].virt_lines_above == true, text = vl[1][1][1] }
+      end
+    end
+    check("EOF insert renders under the last line", placed,
+      { row = 2, above = false, text = "appended" })
+    input("<Tab>")
+    later(200, function()
+      check("Tab accepts an insert past the last line", buf_text(),
+        "alpha\nbeta\n__eof__\nappended\nsecond")
+      input("<Esc>")
+    end)
+  end, function()
+    check("EOF suggestion arrives", false, true)
+    input("<Esc>")
+  end)
+end
+
+vim.api.nvim_buf_set_lines(0, 0, -1, false, { "alpha", "beta", "__eof__" })
+vim.api.nvim_win_set_cursor(0, { 3, 0 })
+later(50, round8)
+feed("A")
+
 io.stdout:write(failed == 0 and "ALL PASS\n" or (failed .. " FAILURES\n"))
 vim.cmd(failed == 0 and "qall!" or "cquit!")

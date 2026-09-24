@@ -91,6 +91,10 @@ local function ago(t)
   return math.floor(d / 60) .. "m ago"
 end
 
+-- Defined with the other edit helpers below. Declared here so the log
+-- dashboard can report what <Tab> would do without a second copy of the rule.
+local cursor_at
+
 -- Persistent debug surface rendered by :NeocursorLog. The top block is a LIVE
 -- dashboard of the state machine — the phase we're in, what <Tab> would do at
 -- this instant (Cursor's cursorAtInlineEdit rule), the self-echo guard, the
@@ -112,9 +116,7 @@ local function log_refresh()
     if vim.api.nvim_get_current_buf() ~= s.bufnr then
       tab_now = "— other buf"
     else
-      local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
-      local at = (s.end0_excl <= s.start0) and (row0 == s.start0)
-        or (row0 >= s.start0 and row0 < s.end0_excl)
+      local at = cursor_at(s.start0, s.end0_excl)
       tab_now = at and "ACCEPT edit" or ("JUMP → L" .. (s.start0 + 1))
     end
   elseif state.prediction then
@@ -207,8 +209,12 @@ end
 
 -- Is the cursor currently on the edit's target region? This is Cursor's
 -- `cursorAtInlineEdit`: when false, <Tab> jumps here; when true, <Tab> accepts.
-local function cursor_at(start0, end0_excl)
+-- An insert that starts at or past the last buffer line has no row of its own;
+-- the cursor on that last line is already there.
+function cursor_at(start0, end0_excl)
   local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local lc = vim.api.nvim_buf_line_count(vim.api.nvim_get_current_buf())
+  if start0 >= lc then return row0 == lc - 1 end
   if end0_excl <= start0 then return row0 == start0 end
   return row0 >= start0 and row0 < end0_excl
 end
@@ -945,8 +951,12 @@ local function do_accept(s)
   vim.cmd("let &g:undolevels=&g:undolevels") -- one undo reverts the whole accept
   begin_apply(s.bufnr)
   local lc = vim.api.nvim_buf_line_count(s.bufnr)
-  vim.api.nvim_buf_set_lines(s.bufnr, s.start0, math.min(s.end0_excl, lc), false, s.lines)
-  local pos = { s.start0 + #s.lines, #(s.lines[#s.lines] or "") }
+  -- A range that starts past EOF is an append. Clamping both ends keeps
+  -- set_lines from seeing start > end, and puts the cursor on the new text.
+  local from = math.min(s.start0, lc)
+  local to = math.min(math.max(s.end0_excl, from), lc)
+  vim.api.nvim_buf_set_lines(s.bufnr, from, to, false, s.lines)
+  local pos = { from + #s.lines, #(s.lines[#s.lines] or "") }
   pcall(vim.api.nvim_win_set_cursor, 0, pos)
   mark_seen(s.bufnr)
   advance_after_apply(s) -- local; no network

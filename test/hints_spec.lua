@@ -83,6 +83,28 @@ for _, m in ipairs(marks(ns)) do
 end
 check("label text is the caller's, verbatim", jump_label, "  ⟪neocursor · <Tab> jump⟫")
 
+-- An insert that starts past the last buffer line used to clamp onto that line
+-- with virt_lines_above, so the suggestion drew on top of the text.
+reseed()
+preview.diff(bufnr, 3, {}, { "suggested one", "suggested two" }, nil)
+local eof_add
+for _, m in ipairs(marks(ns)) do
+  if m.details.virt_lines then
+    eof_add = { row = m.row, above = m.details.virt_lines_above == true }
+  end
+end
+check("EOF insert sits under the last line", eof_add, { row = 2, above = false })
+
+reseed()
+preview.diff(bufnr, 1, { "line2 = 2" }, { "inserted", "line2 = 2" }, nil)
+local prepend
+for _, m in ipairs(marks(ns)) do
+  if m.details.virt_lines then
+    prepend = { row = m.row, above = m.details.virt_lines_above == true }
+  end
+end
+check("insert before a real line stays above it", prepend, { row = 1, above = true })
+
 -- ─── preview.prediction ──────────────────────────────────────────────────────
 -- The pill lives in its own namespace so a suggestion clear never kills it.
 local ns_pred = preview.prediction_namespace()

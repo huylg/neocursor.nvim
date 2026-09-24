@@ -19,10 +19,21 @@ for line in sys.stdin:
         req = json.loads(line)
     except json.JSONDecodeError:
         continue
-    edits = [
-        {"text": "line1 = 100", "range": {"start": 1, "endInclusive": 1}},
-        {"text": "line4 = 400", "range": {"start": 4, "endInclusive": 4}},
-    ]
+    content = req.get("content") or ""
+    # Last-line append: the edit starts on the line after EOF (start = n+1,
+    # endInclusive = n). The client must draw it under the last line and let
+    # <Tab> accept it from there.
+    if content.endswith("__eof__"):
+        n = content.count("\n") + 1
+        edits = [{
+            "text": "appended\nsecond",
+            "range": {"start": n + 1, "endInclusive": n},
+        }]
+    else:
+        edits = [
+            {"text": "line1 = 100", "range": {"start": 1, "endInclusive": 1}},
+            {"text": "line4 = 400", "range": {"start": 4, "endInclusive": 4}},
+        ]
     res = {
         "id": req.get("id"),
         "text": edits[0]["text"],

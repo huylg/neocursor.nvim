@@ -54,6 +54,22 @@ end
 ensure_hl()
 vim.api.nvim_create_autocmd("ColorScheme", { callback = ensure_hl, desc = "neocursor diff highlights" })
 
+-- virt_lines drawn under the last buffer line sit in the '~' area. When that
+-- line is also the bottom screen row they are clipped, so nudge the view up
+-- just enough to leave room. No-op when the window already has the space.
+local function reveal_below(bufnr, row0, nlines)
+  if nlines <= 0 or vim.api.nvim_get_current_buf() ~= bufnr then return end
+  local height = vim.api.nvim_win_get_height(0)
+  local room = height - vim.fn.winline()
+  if room >= nlines then return end
+  local view = vim.fn.winsaveview()
+  local topline = (row0 + 1) - height + nlines + 1
+  if topline > view.topline then
+    view.topline = topline
+    vim.fn.winrestview(view)
+  end
+end
+
 ---@return string first, table rest  -- rest = virt_lines chunks
 local function split_first(text)
   local lines = vim.split(text, "\n", { plain = true })
@@ -78,6 +94,8 @@ function M.inline(bufnr, row0, col0, ghost)
     opts.virt_lines = rest
   end
   vim.api.nvim_buf_set_extmark(bufnr, ns, row0, col0, opts)
+  local nbuf = vim.api.nvim_buf_line_count(bufnr)
+  if #rest > 0 and row0 >= nbuf - 1 then reveal_below(bufnr, row0, #rest) end
 end
 
 --- Diff overlay for edits that replace existing lines (overrides / rewrites).
@@ -91,6 +109,7 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
     { result_type = "indices" }
   ) or {}
   local nbuf = vim.api.nvim_buf_line_count(bufnr)
+  local reveal = 0
 
   for _, h in ipairs(hunks) do
     local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
@@ -125,13 +144,23 @@ function M.diff(bufnr, start0, old_lines, new_lines, hint)
       else
         anchor, above = start0 + (sa - 1), false -- pure insert after line sa
       end
-      anchor = math.max(0, math.min(anchor, nbuf - 1))
+      -- An insert whose row is past the last buffer line is an append at EOF.
+      -- Clamping that row and keeping virt_lines_above paints the suggestion
+      -- on top of the last real line, and there is no later row for <Tab> to
+      -- land on. Pin it under the last line instead.
+      if anchor >= nbuf then
+        anchor, above = math.max(0, nbuf - 1), false
+      else
+        anchor = math.max(0, anchor)
+      end
       vim.api.nvim_buf_set_extmark(bufnr, ns, anchor, 0, {
         virt_lines = vlines,
         virt_lines_above = above,
       })
+      if not above and anchor == nbuf - 1 then reveal = math.max(reveal, #vlines) end
     end
   end
+  if reveal > 0 then reveal_below(bufnr, nbuf - 1, reveal) end
 
   -- discoverability hint on the region's first line ("jump" vs "accept").
   -- nil when hints are off: the diff itself already shows what the edit does.
