@@ -308,5 +308,55 @@ vim.api.nvim_win_set_cursor(0, { 3, 0 })
 later(50, round8)
 feed("A")
 
+-- Round 9: a listener edits the buffer *after* the accept echo has been
+-- swallowed (vim.schedule, so the apply guard has already dropped). The cursor
+-- never moved. That used to look like typing and repaint the chain diff.
+local defer_bump = false
+vim.api.nvim_create_autocmd("TextChangedI", {
+  callback = function(args)
+    if not defer_bump then return end
+    if vim.api.nvim_get_current_line() ~= "line1 = 100" then return end
+    defer_bump = false
+    vim.schedule(function()
+      if not vim.api.nvim_buf_is_valid(args.buf) then return end
+      local row = vim.api.nvim_buf_get_lines(args.buf, 4, 5, false)[1]
+      vim.api.nvim_buf_set_lines(args.buf, 4, 5, false, { (row or "") .. " " })
+      vim.api.nvim_buf_set_lines(args.buf, 4, 5, false, { row })
+    end)
+  end,
+})
+local function round9()
+  poll(nc.has_suggestion, 5000, function()
+    check("inline ghost arrives (round 9)", true, true)
+    defer_bump = true
+    input("<Tab>")
+    later(800, function()
+      check("accept applies inline edit (round 9)", line(1), "line1 = 100")
+      check("chain survives a deferred tick bump", nc.has_suggestion(), true)
+      local lines = nc._log_lines()
+      local acc = 0
+      for i, l in ipairs(lines) do
+        if l:find("ACCEPT", 1, true) then acc = i end
+      end
+      local req, shows = 0, 0
+      for i = acc + 1, #lines do
+        if lines[i]:find("REQ ", 1, true) then req = req + 1 end
+        if lines[i]:find("SHOW    diff", 1, true) then shows = shows + 1 end
+      end
+      check("deferred bump does not refetch", req, 0)
+      check("deferred bump does not repaint", shows, 1)
+      input("<Esc>")
+    end)
+  end, function()
+    check("inline ghost arrives (round 9)", false, true)
+    input("<Esc>")
+  end)
+end
+
+vim.api.nvim_buf_set_lines(0, 0, -1, false, seed)
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+later(50, round9)
+feed("A0")
+
 io.stdout:write(failed == 0 and "ALL PASS\n" or (failed .. " FAILURES\n"))
 vim.cmd(failed == 0 and "qall!" or "cquit!")

@@ -293,14 +293,25 @@ local function show_edit(edit)
     end
   end
 
+  local at = mode ~= "inline" and cursor_at(start0, end0_excl) or nil
+  local prev = state.suggestion
+  -- Already on screen. A second paint (echo re-anchor, or the same reply
+  -- arriving again) clears the hint and draws it once more.
+  if prev and prev.bufnr == bufnr and prev.mode == mode and prev.at == at
+    and prev.start0 == start0 and prev.end0_excl == end0_excl
+    and table.concat(prev.lines, "\n") == text
+    and (mode ~= "inline" or (prev.ghost_row == row1 and prev.ghost_col == col0)) then
+    return true
+  end
+
   state.suggestion = {
     bufnr = bufnr, start0 = start0, end0_excl = end0_excl, lines = lines, mode = mode,
+    at = at, ghost_row = row1, ghost_col = col0,
     buf_lines = vim.api.nvim_buf_line_count(bufnr), -- re-anchors end0_excl as typing adds lines
   }
   if mode == "inline" then
     preview.inline(bufnr, row1 - 1, col0, ghost)
   else
-    local at = cursor_at(start0, end0_excl)
     -- Advertise <Esc>, not <C-]>: leaving insert already dismisses (the
     -- ModeChanged handler in setup files the rejection), so the label is true
     -- without mapping a key —
@@ -524,6 +535,26 @@ local function render_result(res)
     state.queue = nil
     log("SUPPRESS " .. suppressed)
     return
+  end
+
+  -- The first edit this reply would actually draw is the one already on screen
+  -- (the chain advanced locally, then a refetch came back with it). Leave it.
+  local shown = state.suggestion
+  if shown then
+    for _, e in ipairs(list) do
+      local have = table.concat(vim.api.nvim_buf_get_lines(bufnr, e.start0, e.end0_excl, false), "\n")
+      if have ~= table.concat(e.lines, "\n") then
+        if e.bufnr == shown.bufnr and e.start0 == shown.start0 and e.end0_excl == shown.end0_excl
+          and #e.lines == #shown.lines then
+          local same = true
+          for i = 1, #e.lines do
+            if e.lines[i] ~= shown.lines[i] then same = false; break end
+          end
+          if same then return end
+        end
+        break
+      end
+    end
   end
 
   clear_suggestion() -- replace whatever was showing (e.g. a retained ghost)
@@ -1229,6 +1260,13 @@ function M.setup(opts)
       end
       local prev_line = state.last_line
       state.last_line = cur[1]
+      -- Cursor stayed put while the tick moved: the accept echo, or another
+      -- listener editing around it. Not a keystroke. Refetching clears the
+      -- chain edit and paints that same reply again.
+      if seen and seen.buf == buf and seen.row == cur[1] and seen.col == cur[2]
+        and state.suggestion and state.suggestion.bufnr == buf then
+        return
+      end
       local typed = not seen or seen.buf ~= buf or seen.tick ~= tick
       if typed then
         local retained = try_retain()
