@@ -36,6 +36,8 @@ local state = {
   log_dirty = false,
   awaiting = false, -- a request is in flight (sent, no reply yet) — dashboard phase
   stderr_tail = {}, -- last stderr lines, replayed if the sidecar dies before ready
+  timer_gen = 0,  -- bumped on cancel so an already-queued debounce callback cannot send
+  apply_gen = 0,  -- non-zero while an accept's own echo events must not refetch
 }
 
 -- Hint chrome — the ⟪neocursor · <Tab> …⟫ label on an edit and the ⟪<Tab> → L42⟫
@@ -215,8 +217,7 @@ end
 -- TextChangedI/CursorMovedI events it enqueues only fire after we return to the
 -- main loop; they observe exactly this state and are swallowed by the autocmd's
 -- duplicate check, so applying or jumping never clears the suggestion/chain it
--- just revealed. (A boolean guard can't do this — it's already reset by the
--- time those events fire.)
+-- just revealed.
 local function mark_seen(bufnr)
   local cur = vim.api.nvim_win_get_cursor(0)
   state.seen = {
@@ -225,6 +226,35 @@ local function mark_seen(bufnr)
     row = cur[1],
     col = cur[2],
   }
+end
+
+-- Cover the echo of a buffer change we just made. mark_seen is not enough when
+-- something else bumps changedtick before our autocmd runs (another TextChangedI
+-- listener editing the buffer): the tick no longer matches, the echo looks like
+-- typing, and the refetch repaints the chain edit the accept just revealed.
+-- The generation stays set through that burst — the echo autocmd clears it on
+-- the following schedule, which runs after every event in the burst — with a
+-- short fallback so a missing echo cannot mute the next real keystroke.
+local function begin_apply(bufnr)
+  state.apply_gen = state.apply_gen + 1
+  state.apply_finish_queued = false
+  local gen = state.apply_gen
+  local function finish()
+    if state.apply_gen ~= gen then return end
+    state.apply_gen = 0
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_get_current_buf() == bufnr then
+      mark_seen(bufnr)
+    end
+  end
+  state.apply_finish = function()
+    if state.apply_gen ~= gen or state.apply_finish_queued then return end
+    state.apply_finish_queued = true
+    vim.schedule(function()
+      state.apply_finish_queued = false
+      finish()
+    end)
+  end
+  vim.defer_fn(finish, 30)
 end
 
 -- Render one edit. If its text simply extends what the user has already typed
@@ -822,6 +852,9 @@ local function should_attach(bufnr)
 end
 
 local function cancel_timer()
+  -- Bump even when no timer is stored: the uv callback may already have queued
+  -- its vim.schedule send, and stopping the handle does not dequeue that.
+  state.timer_gen = state.timer_gen + 1
   if state.timer then
     state.timer:stop(); state.timer:close(); state.timer = nil
   end
@@ -834,8 +867,10 @@ local function schedule_request(keep)
   if not should_attach(vim.api.nvim_get_current_buf()) then return end
   if not keep then clear_suggestion() end
   cancel_timer()
+  local gen = state.timer_gen
   state.timer = uv.new_timer()
   state.timer:start(state.cfg.debounce, 0, vim.schedule_wrap(function()
+    if gen ~= state.timer_gen then return end -- cancelled after the callback was queued
     cancel_timer()
     send_request()
   end))
@@ -843,8 +878,9 @@ end
 
 -- Typing through the ghost: if the inline suggestion still extends what the
 -- user has typed, shrink it in place instead of flickering it away; typing it
--- out in full counts as an accept and walks the chain. Returns true when the
--- suggestion survived (or was consumed) and must not be cleared.
+-- out in full counts as an accept and walks the chain.
+-- Returns "keep" (ghost still there — refresh behind it), "shown" (the next
+-- edit or its jump target is already up — do not refetch), or nil (drop it).
 local function try_retain()
   local s = state.suggestion
   if not (s and s.mode == "inline" and vim.api.nvim_get_current_buf() == s.bufnr) then
@@ -869,10 +905,15 @@ local function try_retain()
     state.suggestion = nil
     log("CONSUME L" .. (s.start0 + 1) .. "  typed through")
     advance_after_apply(s)
-    return true
+    -- "shown": the next edit (or its jump target) is already up. The caller
+    -- must not refresh — that request comes back as the same diff and paints
+    -- a second hint. nil: chain exhausted, caller refetches.
+    if state.suggestion or show_prediction() then return "shown" end
+    state.prediction = nil
+    return nil
   end
-  if state.suggestion.mode ~= "inline" then return false end -- deviated; drop it
-  return true
+  if state.suggestion.mode ~= "inline" then return nil end -- deviated; drop it
+  return "keep"
 end
 
 -- Cursor moves made while an expr mapping evaluates are silently REVERTED when
@@ -902,6 +943,7 @@ local function do_accept(s)
   state.suggestion = nil
   cancel_timer() -- a request scheduled before the accept would race the chain
   vim.cmd("let &g:undolevels=&g:undolevels") -- one undo reverts the whole accept
+  begin_apply(s.bufnr)
   local lc = vim.api.nvim_buf_line_count(s.bufnr)
   vim.api.nvim_buf_set_lines(s.bufnr, s.start0, math.min(s.end0_excl, lc), false, s.lines)
   local pos = { s.start0 + #s.lines, #(s.lines[#s.lines] or "") }
@@ -1032,6 +1074,7 @@ local function do_accept_partial(s)
   -- alone with its indentation (accepting the line break)
   local frag = ghost:match("^\n%s*") or ghost:match("^%s*[^%s]+") or ghost
   local flines = vim.split(frag, "\n", { plain = true })
+  begin_apply(bufnr)
   vim.api.nvim_buf_set_text(bufnr, row1 - 1, col0, row1 - 1, col0, flines)
   local nrow1 = row1 + #flines - 1
   local ncol = #flines > 1 and #flines[#flines] or (col0 + #frag)
@@ -1151,6 +1194,16 @@ function M.setup(opts)
       local buf = vim.api.nvim_get_current_buf()
       local cur = vim.api.nvim_win_get_cursor(0)
       local tick = vim.api.nvim_buf_get_changedtick(buf)
+      -- Our own apply. Swallow it even when the tick no longer matches mark_seen,
+      -- and drop the guard only after this whole burst (a listener ahead of us
+      -- may edit the buffer and queue more TextChangedI before we return).
+      if state.apply_gen ~= 0 then
+        if args.event == "TextChangedI" then state.last_edit_at = os.time() end
+        state.last_line = cur[1]
+        state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
+        if state.apply_finish then state.apply_finish() end
+        return
+      end
       local seen = state.seen
       state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
       -- A real text edit is authoritatively the TextChangedI event (Cursor's
@@ -1168,10 +1221,13 @@ function M.setup(opts)
       state.last_line = cur[1]
       local typed = not seen or seen.buf ~= buf or seen.tick ~= tick
       if typed then
-        if try_retain() then
+        local retained = try_retain()
+        if retained == "keep" then
           schedule_request(true) -- ghost survives; refresh in the background
+        elseif retained == "shown" then
+          cancel_timer() -- chain (or its jump target) is already showing
         else
-          schedule_request()     -- deviated from the suggestion: clear and refetch
+          schedule_request() -- deviated from the suggestion: clear and refetch
         end
       else
         -- Pure cursor movement. Cursor's onDidChangeCursorPosition fires a

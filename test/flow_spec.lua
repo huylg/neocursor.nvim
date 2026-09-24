@@ -23,6 +23,22 @@ local function check(desc, got, want)
 end
 
 local nc = require("neocursor")
+local preview = require("neocursor.preview")
+-- A listener registered BEFORE neocursor's (setup is below) that edits the buffer
+-- during the accept echo. That bumps changedtick, so mark_seen no longer matches
+-- and — without the apply guard — the echo is treated as typing, the chain diff
+-- is cleared, and the refetch paints it a second time.
+local bump_echo = false
+vim.api.nvim_create_autocmd("TextChangedI", {
+  callback = function(args)
+    if not bump_echo then return end
+    if vim.api.nvim_get_current_line() ~= "line1 = 100" then return end
+    bump_echo = false
+    local row = vim.api.nvim_buf_get_lines(args.buf, 4, 5, false)[1]
+    vim.api.nvim_buf_set_lines(args.buf, 4, 5, false, { (row or "") .. " " })
+    vim.api.nvim_buf_set_lines(args.buf, 4, 5, false, { row })
+  end,
+})
 -- NEOCURSOR_SPEC_NO_HINTS=1 reruns this whole spec with the hint chrome off.
 -- Hiding hints is display-only, so every behavioral assertion below — jump,
 -- accept, chain advance — must hold identically in both modes.
@@ -213,6 +229,53 @@ vim.api.nvim_win_set_cursor(0, { 1, 0 })
 vim.api.nvim_set_option_value("undolevels", -1, { buf = 0 }) -- what panel buffers do
 later(50, round6)
 feed("A6") -- blocks while round6 runs; returns on its <Esc>
+
+-- Round 7: accepting an inline ghost reveals the next diff locally. A
+-- TextChangedI listener that edits the buffer in that echo used to make the
+-- tick miss mark_seen, so the echo refetched and painted the same hint again.
+local function hint_count()
+  local n = 0
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(0, preview.namespace(), 0, -1, { details = true })) do
+    local text = ""
+    for _, chunk in ipairs(m[4].virt_text or {}) do text = text .. chunk[1] end
+    if text:find("neocursor", 1, true) then n = n + 1 end
+  end
+  return n
+end
+local function round7()
+  poll(nc.has_suggestion, 5000, function()
+    check("inline ghost arrives (round 7)", true, true)
+    bump_echo = true
+    input("<Tab>")
+    later(800, function()
+      check("accept applies inline edit", line(1), "line1 = 100")
+      check("chain survives an echo that bumps changedtick", nc.has_suggestion(), true)
+      local lines = nc._log_lines()
+      local acc = 0
+      for i, l in ipairs(lines) do
+        if l:find("ACCEPT", 1, true) then acc = i end
+      end
+      local req, shows = 0, 0
+      for i = acc + 1, #lines do
+        if lines[i]:find("REQ ", 1, true) then req = req + 1 end
+        if lines[i]:find("SHOW    diff", 1, true) then shows = shows + 1 end
+      end
+      check("accept echo does not refetch", req, 0)
+      check("chain diff is shown once", shows, 1)
+      check("one discoverability hint", hint_count(), no_hints and 0 or 1)
+      input("<Esc>")
+    end)
+  end, function()
+    check("inline ghost arrives (round 7)", false, true)
+    input("<Esc>")
+  end)
+end
+
+vim.api.nvim_buf_set_lines(0, 0, -1, false, seed)
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.cmd("setlocal undolevels<")
+later(50, round7)
+feed("A0") -- inline ghost, same prefix as round 5
 
 io.stdout:write(failed == 0 and "ALL PASS\n" or (failed .. " FAILURES\n"))
 vim.cmd(failed == 0 and "qall!" or "cquit!")
