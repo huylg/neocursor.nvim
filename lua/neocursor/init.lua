@@ -231,6 +231,7 @@ local function mark_seen(bufnr)
     tick = vim.api.nvim_buf_get_changedtick(bufnr),
     row = cur[1],
     col = cur[2],
+    line = vim.api.nvim_get_current_line(),
   }
 end
 
@@ -1241,17 +1242,16 @@ function M.setup(opts)
       if state.apply_gen ~= 0 then
         if args.event == "TextChangedI" then state.last_edit_at = os.time() end
         state.last_line = cur[1]
-        state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
+        state.seen = {
+          buf = buf, tick = tick, row = cur[1], col = cur[2],
+          line = vim.api.nvim_get_current_line(),
+        }
         if state.apply_finish then state.apply_finish() end
         return
       end
       local seen = state.seen
-      state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2] }
-      -- A real text edit is authoritatively the TextChangedI event (Cursor's
-      -- onDidChangeContent → lastEditTime). The tick heuristic below can't tell
-      -- a genuine edit from a buffer switch, so the reading-code clock keys off
-      -- the event name instead.
-      if args.event == "TextChangedI" then state.last_edit_at = os.time() end
+      local cur_line = vim.api.nvim_get_current_line()
+      state.seen = { buf = buf, tick = tick, row = cur[1], col = cur[2], line = cur_line }
       -- identical state = the echo of our own apply/jump, or the second of the
       -- two events one keystroke fires — nothing actually happened
       if seen and seen.buf == buf and seen.tick == tick
@@ -1260,13 +1260,20 @@ function M.setup(opts)
       end
       local prev_line = state.last_line
       state.last_line = cur[1]
-      -- Cursor stayed put while the tick moved: the accept echo, or another
-      -- listener editing around it. Not a keystroke. Refetching clears the
-      -- chain edit and paints that same reply again.
+      -- Tick moved, cursor and this line did not. autoread/checktime does this
+      -- (updatetime writes the file, then reloads it): changedtick bumps, the
+      -- bytes do not. Treating that as typing clears the suggestion and paints
+      -- the same reply again.
       if seen and seen.buf == buf and seen.row == cur[1] and seen.col == cur[2]
+        and seen.line == cur_line
         and state.suggestion and state.suggestion.bufnr == buf then
         return
       end
+      -- A real text edit is authoritatively the TextChangedI event (Cursor's
+      -- onDidChangeContent → lastEditTime). The tick heuristic below can't tell
+      -- a genuine edit from a buffer switch, so the reading-code clock keys off
+      -- the event name instead.
+      if args.event == "TextChangedI" then state.last_edit_at = os.time() end
       local typed = not seen or seen.buf ~= buf or seen.tick ~= tick
       if typed then
         local retained = try_retain()

@@ -358,5 +358,40 @@ vim.api.nvim_win_set_cursor(0, { 1, 0 })
 later(50, round9)
 feed("A0")
 
+-- Round 10: autoread reloads the file after it is written (the user's
+-- autowriteall + checktime on CursorHoldI, updatetime 1000ms). changedtick
+-- bumps, the bytes and the cursor do not. That used to paint the suggestion again.
+local function round10()
+  poll(nc.has_suggestion, 5000, function()
+    check("inline ghost arrives (round 10)", true, true)
+    vim.o.autoread = true
+    vim.cmd("silent write!")
+    vim.fn.system({ "touch", vim.fn.expand("%:p") })
+    local before = #nc._log_lines()
+    vim.cmd("checktime")
+    later(400, function()
+      check("reload keeps the suggestion", nc.has_suggestion(), true)
+      check("reload keeps the typed line", line(1), "line1 = 10")
+      local lines = nc._log_lines()
+      local req, shows = 0, 0
+      for i = before + 1, #lines do
+        if lines[i]:find("REQ ", 1, true) then req = req + 1 end
+        if lines[i]:find("SHOW", 1, true) then shows = shows + 1 end
+      end
+      check("file reload does not refetch", req, 0)
+      check("file reload does not repaint", shows, 0)
+      input("<Esc>")
+    end)
+  end, function()
+    check("inline ghost arrives (round 10)", false, true)
+    input("<Esc>")
+  end)
+end
+
+vim.api.nvim_buf_set_lines(0, 0, -1, false, seed)
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+later(50, round10)
+feed("A0")
+
 io.stdout:write(failed == 0 and "ALL PASS\n" or (failed .. " FAILURES\n"))
 vim.cmd(failed == 0 and "qall!" or "cquit!")
