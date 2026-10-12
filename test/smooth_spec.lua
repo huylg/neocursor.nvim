@@ -50,6 +50,18 @@ local function fresh(name, content, opts)
   pause(40)
   nc.suggest()
 end
+fresh("diagnostics.py", { "old" })
+local diagnostic_requests = logs("REQ ")
+local diagnostic_ns = vim.api.nvim_create_namespace("neocursor-test-diagnostics")
+for i = 1, 4 do
+  vim.diagnostic.set(diagnostic_ns, 0, { { lnum = 0, col = 0, message = "LSP update " .. i } })
+  pause(5)
+end
+check("diagnostics preserve the in-flight request", logs("REQ "), diagnostic_requests)
+check("diagnostics do not cancel an unchanged snapshot", logs("diagnostics changed"), 0)
+check("original request still displays after diagnostic burst", wait(nc.has_suggestion), true)
+vim.diagnostic.reset(diagnostic_ns)
+
 fresh("stream.py", { "old", "second", "third" })
 check("first streamed edit arrives", wait(nc.has_suggestion), true)
 check("stream not finished at first preview", logs("first-edit=") > 0, true)

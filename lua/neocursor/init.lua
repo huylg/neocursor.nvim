@@ -748,7 +748,16 @@ local function handle_result(res)
     end
     return
   end
-  if res.event == "edit" then
+  if res.event == "timing" then
+    log(
+      ("TIMING  #%d headers=%sms first-chunk=%sms"):format(
+        r.id,
+        tostring(res.headers_ms),
+        tostring(res.first_chunk_ms)
+      )
+    )
+    return
+  elseif res.event == "edit" then
     if type(res.index) ~= "number" or res.index < 1 or res.index % 1 ~= 0 then return end
     if r.events[res.index] then return end -- duplicate delivery
     r.events[res.index] = res.edit
@@ -1809,7 +1818,10 @@ function M.setup(opts)
       if diag_keys[args.buf] == key then return end
       diag_keys[args.buf] = key
       if args.buf == vim.api.nvim_get_current_buf() and suggestion_mode() and not state.suggestion then
-        invalidate("diagnostics changed")
+        -- LSP diagnostics often arrive just after a keystroke. They do not
+        -- invalidate the request's text snapshot: keep that work (and its
+        -- debounce deadline) alive. The next request gathers fresh errors.
+        if state.timer or (state.req and not state.req.done and not state.req.cancelled) then return end
         schedule_request(true)
       end
     end,

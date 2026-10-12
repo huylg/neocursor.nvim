@@ -123,13 +123,17 @@ with tempfile.TemporaryDirectory() as td:
                 "language": "python",
             }
         )
-        reply = sc.wait_for("out", lambda b: b'"id": 42' in b or b'"id":42' in b, timeout=90)
+        def terminal_reply(raw):
+            message = json.loads(raw)
+            return message.get("id") == 42 and message.get("event") in ("done", "error", "cancelled")
+
+        reply = sc.wait_for("out", terminal_reply, timeout=90)
         check("request gets a framed reply", reply is not None)
         if reply:
             j = json.loads(reply.decode())
             # A fake token can only produce an error — what matters is that the
             # process framed it and stayed alive instead of dying.
-            check("reply is an error (fake token), not a crash", "error" in j or "text" in j)
+            check("reply is an error (fake token), not a crash", j.get("event") == "error" and "error" in j)
             check("process still alive after the error", sc.p.poll() is None)
     finally:
         sc.close()

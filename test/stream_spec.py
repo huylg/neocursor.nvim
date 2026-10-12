@@ -1,7 +1,7 @@
 """Offline tests for the real StreamCpp decoder and bounded request workers."""
 import json
 import sys
-import threading
+import asyncio
 import time
 from pathlib import Path
 
@@ -22,10 +22,10 @@ class Response:
         self.status_error = status_error
         self.closed = False
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *args):
+    async def __aexit__(self, *args):
         self.close()
 
     def close(self):
@@ -35,8 +35,9 @@ class Response:
         if self.status_error:
             raise RuntimeError('HTTP 401')
 
-    def iter_bytes(self):
-        yield from self.chunks
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
 
 
 class Client:
@@ -63,7 +64,7 @@ def chunks():
 
 
 sidecar.CLIENT = Client(Response(chunks()))
-result = sidecar.complete(req, emit=events.append)
+result = asyncio.run(sidecar.complete(req, emit=lambda e: events.append(e) if e["event"] != "timing" else None))
 assert [e['event'] for e in events] == ['edit', 'prediction', 'edit']
 assert result['edits'][1]['text'] == '' and events[-1]['index'] == 2
 print('ok completed edits stream early, combined fields, split frames, deletion')
@@ -76,64 +77,104 @@ for response, expected in [
 ]:
     sidecar.CLIENT = Client(response)
     try:
-        sidecar.complete(req)
+        asyncio.run(sidecar.complete(req))
         raise AssertionError('expected protocol failure')
     except RuntimeError as exc:
         assert expected in str(exc), str(exc)
     assert response.closed
 print('ok HTTP, trailer, truncated-frame and incomplete-edit errors')
 
-cancel = threading.Event()
-emitted = []
+# Hold the real HTTP transport before headers or between body chunks. A newer
+# request must finish while the old peer is STILL blocked (no release/timeout).
+async def cancellation_cases():
+    for phase in ("headers", "body"):
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        handlers = set()
 
-def cancelled_chunks():
-    yield first
-    cancel.set()
-    yield second
+        async def serve(reader, writer):
+            handlers.add(asyncio.current_task())
+            try:
+                header = await reader.readuntil(b"\r\n\r\n")
+                length = int(next(line.split(b":", 1)[1] for line in header.split(b"\r\n")
+                                  if line.lower().startswith(b"content-length:")))
+                body = await reader.readexactly(length)
+                slow = b"slow.py" in body
+                payload = first + frame({}, 2)
+                if slow and phase == "headers":
+                    blocked.set()
+                    await release.wait()
+                writer.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " +
+                             str(len(payload)).encode() + b"\r\n\r\n")
+                await writer.drain()
+                if slow and phase == "body":
+                    writer.write(payload[:3])  # blocked mid-frame
+                    await writer.drain()
+                    blocked.set()
+                    await release.wait()
+                writer.write(payload[3:] if slow and phase == "body" else payload)
+                await writer.drain()
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                handlers.discard(asyncio.current_task())
 
-sidecar.CLIENT = Client(Response(cancelled_chunks()))
-assert sidecar.complete(req, cancel.is_set, emitted.append) is None
-assert len(emitted) == 1
-print('ok cancelled stream emits no later edits')
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        sidecar.STREAM_URL = "http://127.0.0.1:%d/cpp" % server.sockets[0].getsockname()[1]
+        events, done = [], asyncio.Event()
+        def emit(event):
+            events.append(event)
+            if event['id'] == 100 and event['event'] == 'done':
+                done.set()
+        async with sidecar.httpx.AsyncClient(timeout=30, trust_env=False) as client:
+            sidecar.CLIENT = client
+            lane = sidecar.RequestLane(emit)
+            lane.submit(dict(req, id=1, path='slow.py'))
+            try:
+                await asyncio.wait_for(blocked.wait(), 2)
+                start = time.monotonic()
+                for i in range(2, 101):
+                    lane.submit(dict(req, id=i))
+                await asyncio.wait_for(done.wait(), 1)
+                elapsed = (time.monotonic() - start) * 1000
+                assert not release.is_set()
+                assert [e['id'] for e in events if e['event'] == 'edit'] == [100]
+                assert any(e['id'] == 1 and e['event'] == 'cancelled' for e in events)
+                print('ok cancellation during %s: newest reply %.1fms, old peer still blocked' % (phase, elapsed))
+            finally:
+                await lane.close()
+                release.set()
+                server.close()
+                await server.wait_closed()
+                if handlers:
+                    await asyncio.gather(*handlers, return_exceptions=True)
 
-# Flood a lane while its first worker is held: only the last pending request runs.
-original = sidecar.complete
-entered, release = threading.Event(), threading.Event()
-started, results = [], []
-lock = threading.Lock()
-active = peak = 0
-
-def held_complete(request, cancelled, publish, bind):
-    global active, peak
-    with lock:
-        active += 1
-        peak = max(peak, active)
+    # Cancelling only pending work must never start it; lanes stay independent.
+    original = sidecar.complete
+    entered, finish = asyncio.Event(), asyncio.Event()
+    started, events = [], []
+    async def held(request, emit):
         started.append(request['id'])
-    response = Response([])
-    bind(response)
-    entered.set()
-    if request['id'] == 1:
-        release.wait(2)
-        assert response.closed, 'cancel must close the active response'
-    publish({'event': 'edit', 'index': 1, 'edit': {'text': 'x'}})
-    with lock:
-        active -= 1
-    return None if cancelled() else {}
+        entered.set()
+        await finish.wait()
+        emit({'event': 'edit'})
+    sidecar.complete = held
+    fg, bg = sidecar.RequestLane(events.append), sidecar.RequestLane(events.append)
+    fg.submit({'id': 1})
+    await entered.wait()
+    bg.submit({'id': 2})
+    bg.cancel(2)
+    fg.cancel(99)  # wrong id does not cancel active work
+    finish.set()
+    await asyncio.sleep(.01)
+    await fg.close()
+    await bg.close()
+    sidecar.complete = original
+    assert started == [1]
+    assert any(e['id'] == 1 and e['event'] == 'done' for e in events)
+    print('ok pending cancellation and unrelated cancellation')
 
-sidecar.complete = held_complete
-lane = sidecar.RequestLane(results.append)
-lane.submit({'id': 1})
-assert entered.wait(1)
-for i in range(2, 101):
-    lane.submit({'id': i})
-release.set()
-deadline = time.monotonic() + 2
-while not any(e.get('id') == 100 and e['event'] == 'done' for e in results) and time.monotonic() < deadline:
-    time.sleep(.005)
-lane.close()
-sidecar.complete = original
-assert started == [1, 100], started
-assert peak == 1
-assert not any(e['id'] == 1 and e['event'] == 'edit' for e in results)
-print('ok bounded worker, newest pending request, transport cancellation')
+asyncio.run(cancellation_cases())
 print('ALL PASS')

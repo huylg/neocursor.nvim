@@ -7,7 +7,7 @@ Protocol (one JSON object per line, both directions):
         "additional_files"?:[{path,is_open,last_viewed_at?,ranges:[{start,stop,content}]}],
         "linter_errors"?:{path,errors:[{message,source?,severity,range:{sl,sc,el,ec}}]},
         "file_diff_histories"?:[{file_name,diff_history:[str],diff_history_timestamps:[ms]}]}
-  Request purpose: "foreground" (default) or "prefetch"; each has one worker.
+  Request purpose: "foreground" (default) or "prefetch"; each has one HTTP task.
   Config advertises {"config":{"protocol":2,...}} before requests are served.
   Cancellation (protocol 2): {"op":"cancel","id":N}
   out: {"id":N,"event":"edit","index":int1,
@@ -16,6 +16,7 @@ Protocol (one JSON object per line, both directions):
        {"id":N,"event":"done"}
        {"id":N,"event":"error","error":str}
        {"id":N,"event":"cancelled","aborted":true}
+       {"id":N,"event":"timing","headers_ms":number,"first_chunk_ms":number}
 
 An edit is emitted only after doneEdit. Indices preserve backend order;
 request ranges refer to the original snapshot. Neovim also accepts legacy
@@ -26,7 +27,7 @@ line/col in the request are 0-indexed (neovim). range in the reply is
 
 Launch:  uv run --with 'httpx[http2]' sidecar.py
 """
-import io, os, sys, json, base64, time, sqlite3, struct, socket, subprocess, threading
+import io, os, sys, json, base64, time, sqlite3, struct, socket, subprocess, asyncio
 import httpx
 import cursor_paths
 
@@ -142,14 +143,14 @@ HEADERS = {
 STREAM_URL = URL
 
 
-def fetch_config() -> dict:
+async def fetch_config() -> dict:
     url = URL.rsplit("/", 1)[0] + "/CppConfig"
     h = dict(HEADERS)
     h["authorization"] = f"Bearer {TOK}"
     h["x-cursor-checksum"] = checksum(MID, MAC)
     h["content-type"] = "application/json"  # CppConfig is unary, not connect+json
     try:
-        r = CLIENT.post(url, content=json.dumps({"model": "", "supportsCpt": True}).encode(), headers=h, timeout=10)
+        r = await CLIENT.post(url, content=json.dumps({"model": "", "supportsCpt": True}).encode(), headers=h, timeout=10)
         return r.json() if r.status_code == 200 else {}
     except Exception:
         return {}
@@ -205,7 +206,8 @@ def _linter(l: dict) -> dict:
     return {"relativeWorkspacePath": l.get("path") or "untitled", "errors": errors}
 
 
-def complete(req: dict, cancelled=lambda: False, emit=None, bind_response=None):
+async def complete(req: dict, emit=None):
+    started = time.monotonic()
     body = {
         "currentFile": {
             "relativeWorkspacePath": req.get("path") or "untitled",
@@ -292,19 +294,21 @@ def complete(req: dict, cancelled=lambda: False, emit=None, bind_response=None):
         if j.get("doneEdit"):
             flush()
 
-    # Stream the reply and bail between chunks once superseded: exiting the
-    # `with` closes the HTTP/2 stream, i.e. Cursor's cancelCpp-on-abort. The
-    # connect frames (1B flag + 4B len) can split across chunks, so buffer.
+    # Task cancellation interrupts pending headers and reads, not just the
+    # gaps between chunks. The context manager closes the response on exit.
+    # Connect frames (1B flag + 4B len) can split across chunks, so buffer.
     buf = b""
-    with CLIENT.stream(
+    async with CLIENT.stream(
         "POST", STREAM_URL, content=frame(json.dumps(body).encode()), headers=h
     ) as r:
-        if bind_response:
-            bind_response(r)
         r.raise_for_status()
-        for chunk in r.iter_bytes():
-            if cancelled():
-                return None
+        headers_ms = (time.monotonic() - started) * 1000
+        first_chunk = True
+        async for chunk in r.aiter_bytes():
+            if first_chunk:
+                emit({"event": "timing", "headers_ms": round(headers_ms, 1),
+                      "first_chunk_ms": round((time.monotonic() - started) * 1000, 1)})
+                first_chunk = False
             buf += chunk
             while len(buf) >= 5:
                 ln = struct.unpack(">I", buf[1:5])[0]
@@ -312,8 +316,6 @@ def complete(req: dict, cancelled=lambda: False, emit=None, bind_response=None):
                     break
                 feed(buf[0], buf[5 : 5 + ln])
                 buf = buf[5 + ln :]
-    if cancelled():
-        return None
     if buf:
         raise RuntimeError("truncated Connect frame")
     # Only doneEdit makes an edit acceptable; an interrupted edit is discarded.
@@ -329,15 +331,15 @@ def complete(req: dict, cancelled=lambda: False, emit=None, bind_response=None):
     }
 
 
-def main():
+async def main():
     global STREAM_URL, TOK, MID, MAC, CLIENT
     try:
         TOK, MID, MAC = read_session()
     except Exception as exc:
         sys.stderr.write(f"neocursor sidecar: {exc}\n")
         raise SystemExit(1)
-    CLIENT = httpx.Client(http2=True, timeout=30)
-    cfg = fetch_config()
+    CLIENT = httpx.AsyncClient(http2=True, timeout=30)
+    cfg = await fetch_config()
     if cfg.get("cppUrl"):
         STREAM_URL = cfg["cppUrl"].rstrip("/") + "/aiserver.v1.AiService/StreamCpp"
     sys.stderr.write("neocursor sidecar ready\n")
@@ -352,19 +354,18 @@ def main():
         "is_fused": cfg.get("isFusedCursorPredictionModel"),
     }}) + "\n")
     sys.stdout.flush()
-    # One worker per lane. Pending work is replaceable, so typing cannot create
-    # an unbounded number of network threads. Cancellation also closes the
-    # active response instead of waiting for the next chunk to arrive.
-    wlock = threading.Lock()
-
+    # All network work lives on one event loop. Stdin is the only blocking
+    # operation, and runs in a reader thread (also works with Windows pipes).
     def emit(obj):
-        with wlock:
-            sys.stdout.write(json.dumps(obj) + "\n")
-            sys.stdout.flush()
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
 
     lanes = {name: RequestLane(emit) for name in ("foreground", "prefetch")}
     try:
-        for line in sys.stdin:
+        while True:
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if not line:
+                break
             if not line.strip():
                 continue
             try:
@@ -386,88 +387,72 @@ def main():
             lane.submit(req)
     finally:
         for lane in lanes.values():
-            lane.close()
-        CLIENT.close()
+            await lane.close()
+        await CLIENT.aclose()
 
 
 class RequestLane:
-    """A single network worker with a newest-wins pending slot."""
+    """One cancellable HTTP task and one replaceable pending request per lane."""
 
     def __init__(self, emit):
         self.emit = emit
-        self.condition = threading.Condition()
+        self.wake = asyncio.Event()
         self.pending = None
         self.active = None
         self.stopped = False
-        self.worker = threading.Thread(target=self.run, daemon=True)
-        self.worker.start()
-
-    def _cancel_active(self, rid=None):
-        active = self.active
-        if active and (rid is None or active["req"].get("id") == rid):
-            active["cancelled"].set()
-            response = active.get("response")
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    pass
+        self.worker = asyncio.create_task(self.run())
 
     def cancel(self, rid=None):
-        with self.condition:
-            if self.pending and (rid is None or self.pending.get("id") == rid):
-                self.pending = None
-            self._cancel_active(rid)
+        if self.pending and (rid is None or self.pending.get("id") == rid):
+            self.pending = None
+        if self.active and (rid is None or self.active["id"] == rid):
+            task = self.active["task"]
+            # Repeated cancels must not interrupt the transport's cleanup.
+            if not self.active["cancelled"]:
+                self.active["cancelled"] = True
+                if not task.done():
+                    task.cancel()
 
     def submit(self, req):
-        with self.condition:
-            self._cancel_active()
-            self.pending = req
-            self.condition.notify()
+        self.cancel()
+        self.pending = req
+        self.wake.set()
 
-    def close(self):
-        with self.condition:
-            self.stopped = True
-            self.pending = None
-            self._cancel_active()
-            self.condition.notify()
-        self.worker.join(timeout=1)
+    async def close(self):
+        self.stopped = True
+        self.cancel()
+        self.wake.set()
+        await self.worker
 
-    def run(self):
-        while True:
-            with self.condition:
-                self.condition.wait_for(lambda: self.pending is not None or self.stopped)
-                if self.stopped:
-                    return
-                req, self.pending = self.pending, None
-                active = {"req": req, "cancelled": threading.Event(), "response": None}
-                self.active = active
+    async def run(self):
+        while not self.stopped:
+            await self.wake.wait()
+            self.wake.clear()
+            if self.stopped:
+                return
+            if self.pending is None:
+                continue
+            req, self.pending = self.pending, None
             rid = req.get("id")
+            active = {"id": rid, "cancelled": False}
 
             def publish(event):
-                if not active["cancelled"].is_set():
+                if not active["cancelled"]:
                     self.emit(dict(event, id=rid))
 
-            def bind(response):
-                # No lock around network close: cancellation may arrive before
-                # headers, and the response must close as soon as it is bound.
-                active["response"] = response
-                if active["cancelled"].is_set():
-                    response.close()
-
+            task = asyncio.create_task(complete(req, emit=publish))
+            active["task"] = task
+            self.active = active
             try:
-                result = complete(req, active["cancelled"].is_set, publish, bind)
-                if result is not None:
-                    publish({"event": "done"})
+                await task
+                publish({"event": "done"})
+            except asyncio.CancelledError:
+                self.emit({"id": rid, "event": "cancelled", "aborted": True})
             except Exception as exc:
                 publish({"event": "error", "error": str(exc)})
             finally:
-                if active["cancelled"].is_set():
-                    self.emit({"id": rid, "event": "cancelled", "aborted": True})
-                with self.condition:
-                    if self.active is active:
-                        self.active = None
+                self.active = None
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

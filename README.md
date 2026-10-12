@@ -212,8 +212,11 @@ fixture-test claims, not a guarantee of identical live Cursor predictions.
 | Server debounce and known suppression heuristics | Supported; unknown heuristics logged |
 | Exact context/model/request parity with Cursor | Not established |
 
-`:NeocursorLog` reports first-edit/display timing, cancellation reasons,
-prefetch hits/misses, and jump-loading state. Real network latency and
+`:NeocursorLog` reports response-header/first-chunk and first-edit/display timing,
+cancellation reasons, prefetch hits/misses, and jump-loading state. Superseded
+requests are interrupted even while waiting for headers or a stalled body;
+diagnostics updates preserve requests whose buffer snapshot is still valid.
+Real network latency and
 cross-file prediction quality require live comparison; CI uses offline fixtures.
 
 ---
