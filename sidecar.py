@@ -7,10 +7,19 @@ Protocol (one JSON object per line, both directions):
         "additional_files"?:[{path,is_open,last_viewed_at?,ranges:[{start,stop,content}]}],
         "linter_errors"?:{path,errors:[{message,source?,severity,range:{sl,sc,el,ec}}]},
         "file_diff_histories"?:[{file_name,diff_history:[str],diff_history_timestamps:[ms]}]}
-  out: {"id":N,"text":str,"range":{...}|null,
-        "edits":[{"text":str,"range":{"start":int1,"endInclusive":int1}|null}],
-        "prediction":{"path":str,"line":int1}|null}   # text/range == edits[0]
-       {"id":N,"error":str}
+  Request purpose: "foreground" (default) or "prefetch"; each has one worker.
+  Config advertises {"config":{"protocol":2,...}} before requests are served.
+  Cancellation (protocol 2): {"op":"cancel","id":N}
+  out: {"id":N,"event":"edit","index":int1,
+        "edit":{"text":str,"range":{"start":int1,"endInclusive":int1}}}
+       {"id":N,"event":"prediction","prediction":{"path":str,"line":int1}}
+       {"id":N,"event":"done"}
+       {"id":N,"event":"error","error":str}
+       {"id":N,"event":"cancelled","aborted":true}
+
+An edit is emitted only after doneEdit. Indices preserve backend order;
+request ranges refer to the original snapshot. Neovim also accepts legacy
+single-result replies from custom sidecars.
 
 line/col in the request are 0-indexed (neovim). range in the reply is
 1-indexed inclusive (as Cursor's backend returns it).
@@ -122,15 +131,8 @@ def read_session():
     return tok, mid, sj.get("telemetry.macMachineId") or mid
 
 
-try:
-    TOK, MID, MAC = read_session()
-except Exception as e:
-    # The common first-run failure is "Cursor isn't where we looked", and a
-    # traceback buries it. The client replays these lines verbatim in :messages.
-    sys.stderr.write(f"neocursor sidecar: {e}\n")
-    sys.stderr.flush()
-    raise SystemExit(1)
-CLIENT = httpx.Client(http2=True, timeout=30)
+TOK = MID = MAC = None
+CLIENT = None
 HEADERS = {
     "x-cursor-client-version": "1.1.3",
     "x-cursor-client-type": "ide",
@@ -203,7 +205,7 @@ def _linter(l: dict) -> dict:
     return {"relativeWorkspacePath": l.get("path") or "untitled", "errors": errors}
 
 
-def complete(req: dict, cancelled=lambda: False):
+def complete(req: dict, cancelled=lambda: False, emit=None, bind_response=None):
     body = {
         "currentFile": {
             "relativeWorkspacePath": req.get("path") or "untitled",
@@ -234,6 +236,7 @@ def complete(req: dict, cancelled=lambda: False):
     # the chain's first jump. Split them into an ordered list so the client can
     # walk the chain locally (one Tab per edit) with no extra round-trips.
     edits, cur, prediction = [], None, None
+    emit = emit or (lambda event: None)
 
     def flush():
         nonlocal cur
@@ -244,26 +247,31 @@ def complete(req: dict, cancelled=lambda: False):
                     t = t[2:]
                 elif t.startswith("\n"):
                     t = t[1:]
-            edits.append({"text": t, "range": cur["range"]})
+            edit = {"text": t, "range": cur["range"]}
+            edits.append(edit)
+            emit({"event": "edit", "index": len(edits), "edit": edit})
         cur = None
 
     def feed(flag, msg):
         nonlocal cur, prediction
         if flag & 0x02:
+            trailer = json.loads(msg)
+            if trailer.get("error"):
+                raise RuntimeError("StreamCpp: " + json.dumps(trailer["error"]))
             return
+        if flag & 0x01:
+            raise RuntimeError("unsupported compressed Connect frame")
         try:
             j = json.loads(msg)
-        except Exception:
-            return
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError("invalid StreamCpp JSON frame") from exc
         if j.get("beginEdit"):
             flush()
             cur = {"text": "", "range": None, "eol": False}
-            return
         if "text" in j:
             if cur is None:
                 cur = {"text": "", "range": None, "eol": False}
             cur["text"] += j.get("text", "")
-            return
         rr = j.get("rangeToReplace")
         if rr:
             if cur is None:
@@ -272,15 +280,15 @@ def complete(req: dict, cancelled=lambda: False):
                 "start": rr.get("startLineNumber"),
                 "endInclusive": rr.get("endLineNumberInclusive"),
             }
-            if j.get("shouldRemoveLeadingEol"):
-                cur["eol"] = True
-            return
+        if j.get("shouldRemoveLeadingEol") and cur is not None:
+            cur["eol"] = True
         cpt = j.get("cursorPredictionTarget")
         if cpt and prediction is None:
             prediction = {
                 "path": cpt.get("relativePath"),
                 "line": cpt.get("lineNumberOneIndexed"),
             }
+            emit({"event": "prediction", "prediction": prediction})
         if j.get("doneEdit"):
             flush()
 
@@ -291,6 +299,9 @@ def complete(req: dict, cancelled=lambda: False):
     with CLIENT.stream(
         "POST", STREAM_URL, content=frame(json.dumps(body).encode()), headers=h
     ) as r:
+        if bind_response:
+            bind_response(r)
+        r.raise_for_status()
         for chunk in r.iter_bytes():
             if cancelled():
                 return None
@@ -303,7 +314,11 @@ def complete(req: dict, cancelled=lambda: False):
                 buf = buf[5 + ln :]
     if cancelled():
         return None
-    flush()  # in case the stream ends mid-edit
+    if buf:
+        raise RuntimeError("truncated Connect frame")
+    # Only doneEdit makes an edit acceptable; an interrupted edit is discarded.
+    if cur is not None:
+        raise RuntimeError("stream ended before doneEdit")
 
     first = edits[0] if edits else {"text": "", "range": None}
     return {
@@ -315,13 +330,20 @@ def complete(req: dict, cancelled=lambda: False):
 
 
 def main():
-    global STREAM_URL
+    global STREAM_URL, TOK, MID, MAC, CLIENT
+    try:
+        TOK, MID, MAC = read_session()
+    except Exception as exc:
+        sys.stderr.write(f"neocursor sidecar: {exc}\n")
+        raise SystemExit(1)
+    CLIENT = httpx.Client(http2=True, timeout=30)
     cfg = fetch_config()
     if cfg.get("cppUrl"):
         STREAM_URL = cfg["cppUrl"].rstrip("/") + "/aiserver.v1.AiService/StreamCpp"
     sys.stderr.write("neocursor sidecar ready\n")
     sys.stderr.flush()
     sys.stdout.write(json.dumps({"config": {
+        "protocol": 2,
         "debounce": cfg.get("clientDebounceDurationMillis"),
         "exclude_patterns": cfg.get("excludeRecentlyViewedFilesPatterns") or [],
         "heuristics": cfg.get("heuristics") or [],
@@ -330,54 +352,121 @@ def main():
         "is_fused": cfg.get("isFusedCursorPredictionModel"),
     }}) + "\n")
     sys.stdout.flush()
-    # Requests are served concurrently, newest-wins: each arrival bumps `gen`,
-    # which every older worker polls between stream chunks and bails on (the
-    # editor's abort-and-refire — Cursor's cancelCpp). Without this the loop is
-    # serial, and during a typing burst every reply describes a buffer two
-    # keystrokes old: the client bins it as stale and the user sees nothing.
+    # One worker per lane. Pending work is replaceable, so typing cannot create
+    # an unbounded number of network threads. Cancellation also closes the
+    # active response instead of waiting for the next chunk to arrive.
     wlock = threading.Lock()
-    latest = {"gen": 0}
 
     def emit(obj):
         with wlock:
             sys.stdout.write(json.dumps(obj) + "\n")
             sys.stdout.flush()
 
-    def serve(req, my_gen):
-        rid = req.get("id")
-        if os.environ.get("NC_DUMP"):  # debug: tee each incoming request
-            with open(os.environ["NC_DUMP"], "a") as fh:
-                fh.write(json.dumps(req) + "\n")
+    lanes = {name: RequestLane(emit) for name in ("foreground", "prefetch")}
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                req = json.loads(line)
+            except ValueError as exc:
+                emit({"id": None, "event": "error", "error": str(exc)})
+                continue
+            if not isinstance(req, dict):
+                emit({"id": None, "event": "error", "error": "request must be an object"})
+                continue
+            if req.get("op") == "cancel":
+                for lane in lanes.values():
+                    lane.cancel(req.get("id"))
+                continue
+            lane = lanes.get(req.get("purpose", "foreground"))
+            if lane is None:
+                emit({"id": req.get("id"), "event": "error", "error": "unknown request purpose"})
+                continue
+            lane.submit(req)
+    finally:
+        for lane in lanes.values():
+            lane.close()
+        CLIENT.close()
 
-        def cancelled():
-            return latest["gen"] != my_gen
 
-        try:
-            res = complete(req, cancelled)
-        except Exception as e:
-            # a stream torn down mid-abort raises; that's a cancel, not an error
-            if cancelled():
-                emit({"id": rid, "aborted": True})
-            else:
-                emit({"id": rid, "error": str(e)})
-            return
-        if res is None or cancelled():
-            emit({"id": rid, "aborted": True})
-        else:
-            res["id"] = rid
-            emit(res)
+class RequestLane:
+    """A single network worker with a newest-wins pending slot."""
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception as e:
-            emit({"id": None, "error": str(e)})
-            continue
-        latest["gen"] += 1
-        threading.Thread(target=serve, args=(req, latest["gen"]), daemon=True).start()
+    def __init__(self, emit):
+        self.emit = emit
+        self.condition = threading.Condition()
+        self.pending = None
+        self.active = None
+        self.stopped = False
+        self.worker = threading.Thread(target=self.run, daemon=True)
+        self.worker.start()
+
+    def _cancel_active(self, rid=None):
+        active = self.active
+        if active and (rid is None or active["req"].get("id") == rid):
+            active["cancelled"].set()
+            response = active.get("response")
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def cancel(self, rid=None):
+        with self.condition:
+            if self.pending and (rid is None or self.pending.get("id") == rid):
+                self.pending = None
+            self._cancel_active(rid)
+
+    def submit(self, req):
+        with self.condition:
+            self._cancel_active()
+            self.pending = req
+            self.condition.notify()
+
+    def close(self):
+        with self.condition:
+            self.stopped = True
+            self.pending = None
+            self._cancel_active()
+            self.condition.notify()
+        self.worker.join(timeout=1)
+
+    def run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.pending is not None or self.stopped)
+                if self.stopped:
+                    return
+                req, self.pending = self.pending, None
+                active = {"req": req, "cancelled": threading.Event(), "response": None}
+                self.active = active
+            rid = req.get("id")
+
+            def publish(event):
+                if not active["cancelled"].is_set():
+                    self.emit(dict(event, id=rid))
+
+            def bind(response):
+                # No lock around network close: cancellation may arrive before
+                # headers, and the response must close as soon as it is bound.
+                active["response"] = response
+                if active["cancelled"].is_set():
+                    response.close()
+
+            try:
+                result = complete(req, active["cancelled"].is_set, publish, bind)
+                if result is not None:
+                    publish({"event": "done"})
+            except Exception as exc:
+                publish({"event": "error", "error": str(exc)})
+            finally:
+                if active["cancelled"].is_set():
+                    self.emit({"id": rid, "event": "cancelled", "aborted": True})
+                with self.condition:
+                    if self.active is active:
+                        self.active = None
 
 
 if __name__ == "__main__":

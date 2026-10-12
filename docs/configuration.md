@@ -7,8 +7,11 @@ summary table; this page is the full reference.
 
 ```lua
 require("neocursor").setup({
-  debounce    = 250,
+  debounce    = 250, -- omit to use server timing
+  prefetch    = true,
+  jump_loading_timeout = 1000,
   map_tab     = true,
+  normal_mode = false,
   map_partial = "<M-Right>",
   filetypes   = nil,
   show_hints  = true,
@@ -24,6 +27,9 @@ confirm an option actually took effect.
 ## Contents
 
 - [`debounce`](#debounce)
+- [`prefetch`](#prefetch)
+- [`jump_loading_timeout`](#jump_loading_timeout)
+- [`normal_mode`](#normal_mode)
 - [`map_tab`](#map_tab)
 - [`map_partial`](#map_partial)
 - [`filetypes`](#filetypes)
@@ -38,10 +44,59 @@ confirm an option actually took effect.
 
 Milliseconds of idle time before a request goes out.
 
-**This is usually overridden.** neocursor pulls Cursor's own `CppConfig` at
-startup and adopts its debounce, so the value you set here is a fallback used
-until that arrives (and if the fetch fails). Matching Cursor's timing is the
-point — the plugin aims for parity, not for being faster than the real thing.
+An explicit value is authoritative. If omitted, neocursor adopts the server's
+`CppConfig` timing and uses 250 ms until configuration arrives or if it fails.
+Use a non-negative number of milliseconds.
+
+---
+
+## `prefetch`
+
+`boolean` — default `true`
+
+Prepare one predicted destination before you jump. This can increase backend
+usage even if you never follow the prediction. Set `false` to request only after
+jumping. Foreground typing and speculative work use separate bounded workers;
+there is no recursive background prefetch chain.
+
+Loaded buffers supply their unsaved content. Other files are read without
+opening a window. Cached edits are validated again at landing. Jumps preserve
+unsaved buffers and never write files.
+
+---
+
+## `jump_loading_timeout`
+
+`number` — default `1000`
+
+After an explicit jump, or while awaiting the next edit in a streamed chain,
+Tab is consumed for this many milliseconds while the edit loads. A loading hint
+appears when prediction hints are enabled. Tab never queues acceptance of an
+unseen edit: press it again after the preview appears.
+
+Completion, errors, dismissal, typing or navigation end the loading state early.
+After the timeout, normal snippet/indentation fallback resumes; a still-valid
+reply may appear later. Set `0` to disable this waiting behavior.
+
+For custom mappings, `accept()` returns `true` while it consumes a loading-state
+Tab, while `has_suggestion()` stays `false` until there is an actual edit.
+
+---
+
+## `normal_mode`
+
+`boolean` — default `false`
+
+Set to `true` to request and show suggestions in Normal mode as well as Insert
+and Replace modes. Previews and pending replies survive switching between
+these modes. Normal-mode edits and buffer entry trigger requests; navigation
+uses the same recent-edit and line-change rules as Insert mode.
+
+`<Tab>` accepts or jumps in Normal mode when `map_tab` is enabled. With
+`map_tab = false`, map it yourself to `require("neocursor").accept()`.
+`<Esc>` in Normal mode dismisses and still performs its usual action; leaving
+Insert mode keeps the preview, so press `<Esc>` again to dismiss it.
+Visual, operator-pending and command-line modes clear previews and drop replies.
 
 ---
 
@@ -49,7 +104,8 @@ point — the plugin aims for parity, not for being faster than the real thing.
 
 `boolean` — default `true`
 
-Whether neocursor maps `<Tab>` in insert mode.
+Whether neocursor maps `<Tab>` in Insert mode and, with `normal_mode = true`,
+Normal mode.
 
 Set to `false` when nvim-cmp, blink.cmp, or a snippet engine already owns the
 key, then call `require("neocursor").accept()` from your own handler. Full

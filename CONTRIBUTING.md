@@ -76,12 +76,27 @@ python test/handshake_spec.py
 # the tab-tab-tab flow: canned sidecar, real jobstart plumbing, live insert session
 nvim --headless -u NONE -c "luafile test/flow_spec.lua"
 
+# streaming decoder, errors and bounded cancellation workers (no network)
+uv run --with "httpx[http2]" python test/stream_spec.py
+
+# stable previews, streamed chains, cache validation and cross-file jumps
+nvim --headless -u NONE -l test/smooth_spec.lua
+
+# UTF-8 character patches and shortest-path retention
+nvim --headless -u NONE -l test/text_spec.lua
+
+# completion mapping priority and expression-map textlock handling
+nvim --headless -u NONE -c "luafile test/tab_integration_spec.lua"
+
 # hint chrome: rendering + show_hints normalization
 nvim --headless -u NONE -c "luafile test/hints_spec.lua"
 
 # insert-only: a reply landing after <Esc> is dropped, <C-c> dismisses like
 # <Esc>, <C-o> is a detour — driven through Neovim's real main loop
 nvim --headless -u NONE -c "luafile test/modes_spec.lua"
+
+# opt-in normal-mode previews, acceptance, mode switches, and late replies
+nvim --headless -u NONE -c "luafile test/normal_spec.lua"
 
 # the same behavioral suite with hint chrome disabled — chrome must never
 # change behavior, so these assertions must pass identically

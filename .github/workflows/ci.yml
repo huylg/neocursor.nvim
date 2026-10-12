@@ -48,11 +48,26 @@ jobs:
       - name: headless tab-flow spec (canned sidecar, real jobstart plumbing)
         run: nvim --headless -u NONE -c "luafile test/flow_spec.lua"
 
+      - name: streaming transport and bounded cancellation
+        run: uv run --with "httpx[http2]" python test/stream_spec.py
+
+      - name: stable previews and prepared jumps
+        run: nvim --headless -u NONE -l test/smooth_spec.lua
+
+      - name: UTF-8 character edits
+        run: nvim --headless -u NONE -l test/text_spec.lua
+
+      - name: completion mapping integration
+        run: nvim --headless -u NONE -c "luafile test/tab_integration_spec.lua"
+
       - name: hint chrome spec (show_hints rendering + normalization)
         run: nvim --headless -u NONE -c "luafile test/hints_spec.lua"
 
       - name: insert-only spec (reply after <Esc> dropped, <C-c> dismisses, <C-o> detours)
         run: nvim --headless -u NONE -c "luafile test/modes_spec.lua"
+
+      - name: Normal-mode suggestions
+        run: nvim --headless -u NONE -c "luafile test/normal_spec.lua"
 
       - name: tab-flow spec with hints off (chrome must not change behavior)
         env:

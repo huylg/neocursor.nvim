@@ -26,11 +26,12 @@
 
 No API key. No model to choose. No account to create. If you're already signed
 into Cursor, there is nothing else to set up — neocursor drives Cursor's own
-`StreamCpp` backend with your existing login, so you get the *same* predictions,
-at the *same* latency, as Cursor itself.
+`StreamCpp` backend with your existing login. Prediction quality and latency
+also depend on the client’s context collection and request handling; identical
+results are not guaranteed.
 
 > [!WARNING]
-> **Beta.** The goal is 1:1 parity with Cursor's Tab, and most of it is there.
+> **Beta.** The goal is a smooth Cursor-like Tab workflow in Neovim.
 > See [Cursor Tab parity](#cursor-tab-parity) for the honest scoreboard.
 
 <p align="center">
@@ -107,8 +108,7 @@ Type, pause, and a suggestion appears. Then:
 
 ### The tab-tab-tab flow
 
-One key does three jobs, in Cursor's exact rhythm — accept, then jump, then
-accept again:
+One key accepts an edit, jumps to the next destination, and accepts again:
 
 ```mermaid
 flowchart LR
@@ -120,6 +120,12 @@ flowchart LR
     J -->|Tab| A
     Q -->|"no"| T
 ```
+
+Completed edits appear as soon as they arrive. Compatible typing keeps the
+remaining preview visible, including rewrites and insertions before punctuation.
+The plugin prepares one predicted destination in the background. If you jump
+before its edit is ready, Tab is consumed for up to one second while loading;
+it never accepts an unseen edit. Press Tab again after the preview appears.
 
 The loop back through *jump → accept* is what makes it feel like Cursor rather
 than a completion engine: you keep pressing the same key and the edits come to
@@ -134,7 +140,7 @@ it *counts*, so the same rejected edit isn't offered straight back. This is also
 exactly what Cursor does under a vim layer: its Escape handler dismisses the
 suggestion and lets the keypress through, so the mode change happens too.
 
-Suggestions live in insert mode, full stop. However you leave — `<Esc>`,
+By default, suggestions live in insert mode. However you leave — `<Esc>`,
 `<C-c>`, `<C-\><C-n>` — the suggestion leaves with you, and a reply that
 arrives after you've gone is dropped rather than painted into Normal mode,
 where no key could reach it. The one exception is `<C-o>`: a single Normal
@@ -158,8 +164,11 @@ Every option is optional. This is the complete set, at its defaults:
 
 ```lua
 require("neocursor").setup({
-  debounce    = 250,
+  debounce    = 250, -- explicit value; omit to use server timing
+  prefetch    = true,
+  jump_loading_timeout = 1000,
   map_tab     = true,
+  normal_mode = false,
   map_partial = "<M-Right>",
   filetypes   = nil,
   show_hints  = true,
@@ -169,7 +178,10 @@ require("neocursor").setup({
 
 | Option | Type | Description |
 |---|---|---|
-| `debounce` | `number` | Idle milliseconds before a request. Overridden by Cursor's `CppConfig` at startup. |
+| `debounce` | `number` | Idle milliseconds before a request. Explicit values win; omitted values use server timing with a 250 ms fallback. |
+| `prefetch` | `boolean` | Prepare one predicted destination ahead of Tab; may increase backend usage. |
+| `jump_loading_timeout` | `number` | Maximum milliseconds to consume Tab while a jump or streamed chain loads. |
+| `normal_mode` | `boolean` | `true` enables Normal-mode suggestions, keeps previews across Insert/Normal switches, and maps Normal `<Esc>` to dismiss. See [configuration](./docs/configuration.md#normal_mode). |
 | `map_tab` | `boolean` | `false` leaves `<Tab>` unmapped so nvim-cmp / blink.cmp can own it. |
 | `map_partial` | `string` \| `false` | Key for word-by-word accept. `false` disables it. |
 | `filetypes` | `string[]` \| `nil` | Allow-list, e.g. `{ "python", "lua" }`. `nil` means every normal buffer. |
@@ -177,42 +189,38 @@ require("neocursor").setup({
 | `sidecar_cmd` | `string[]` | How the Python sidecar launches. Override only for unusual setups. |
 
 **Full reference** → [docs/configuration.md](./docs/configuration.md): what each
-option does, why `debounce` is usually overridden, and which hint surface you
+option does, how server timing and explicit `debounce` interact, and which hint surface you
 actually want to keep.
 
 ---
 
 ## Cursor Tab parity
 
-The goal is a **1:1 port of Cursor's Tab** — here's what actually made it
-across, and what's still in flight:
+The client supports the following workflows. These are implementation and
+fixture-test claims, not a guarantee of identical live Cursor predictions.
 
-| Cursor Tab capability | neocursor |
-|---|:---:|
-| Inline multi-line completions (ghost text) | ✅ |
-| Diff-style rewrites of existing lines | ✅ |
-| **Next-edit prediction + cursor jump** (the tab-tab-tab flow) | ✅ |
-| Multi-edit chains — one `<Tab>` per edit, no extra round-trips | ✅ |
-| Recent-edit / diff-history context | ✅ |
-| Nearby-file + linter-error context | ✅ |
-| Request gating — stays quiet while you read/navigate | ✅ |
-| Partial accept (word-by-word) | ✅ |
-| Config pulled live from Cursor (`CppConfig`: debounce, heuristics) | ✅ |
-| macOS / Linux / Windows auth paths | ✅ |
-| Character-level diffs for single-character edits | 🚧 |
-| Cross-file *apply* on jump targets | 🚧 partial — jump lands, chain is partial |
+| Capability | Status |
+|---|---|
+| Inline multiline completions, including before punctuation | Supported |
+| Character-level single-line rewrites and multiline diff previews | Supported |
+| Completed edits displayed before the response finishes | Supported |
+| Compatible typing retains previews without refetching | Supported |
+| Same-file edit chains and predicted jumps | Supported |
+| Cross-file jump preparation and acceptance | Supported; cache revalidated at landing |
+| Word acceptance, dismissal and late-response cancellation | Supported |
+| Recent-buffer context, edit history and diagnostics | Supported, bounded context |
+| Server debounce and known suppression heuristics | Supported; unknown heuristics logged |
+| Exact context/model/request parity with Cursor | Not established |
 
-<sub>✅ ported · 🚧 in progress</sub>
-
-The core loop — predict, ghost, `<Tab>`, jump, chain — is complete and running on
-Cursor's actual backend. The 🚧 rows are edges, not the main path.
+`:NeocursorLog` reports first-edit/display timing, cancellation reasons,
+prefetch hits/misses, and jump-loading state. Real network latency and
+cross-file prediction quality require live comparison; CI uses offline fixtures.
 
 ---
 
 ## How it works
 
-neocursor doesn't reimplement or retrain a model — it *is* Cursor's Tab, reached
-through a tiny stdio bridge:
+neocursor uses Cursor’s Tab backend through a stdio bridge:
 
 ```mermaid
 flowchart LR
@@ -226,8 +234,7 @@ flowchart LR
     SC -.->|"JSON"| NV
 ```
 
-The sidecar reads your local Cursor session, speaks the exact `StreamCpp` call
-Cursor's own client makes, and streams back the edit sequence plus the next
+The sidecar reads your local Cursor session, calls the private `StreamCpp` service, and streams back the edit sequence plus the next
 cursor-jump target. Your token never leaves the machine, and the Lua side never
 touches the network — that boundary is deliberate.
 

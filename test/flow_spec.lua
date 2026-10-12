@@ -51,7 +51,8 @@ nc.setup({
   sidecar_cmd = { vim.fn.executable("python3") == 1 and "python3" or "python", root .. "/test/fake_sidecar.py" },
 })
 
-vim.cmd("edit " .. root .. "/test/spec_scratch.py") -- named file, normal buftype
+local scratch = vim.fn.tempname() .. ".py"
+vim.cmd("edit " .. vim.fn.fnameescape(scratch)) -- named file, normal buftype
 local seed = { "line1 = 1", "line2 = 2", "line3 = 3", "line4 = 4", "line5 = 5" }
 vim.api.nvim_buf_set_lines(0, 0, -1, false, seed)
 
@@ -394,4 +395,5 @@ later(50, round10)
 feed("A0")
 
 io.stdout:write(failed == 0 and "ALL PASS\n" or (failed .. " FAILURES\n"))
+vim.fn.delete(scratch)
 vim.cmd(failed == 0 and "qall!" or "cquit!")

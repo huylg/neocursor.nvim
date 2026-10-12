@@ -16,13 +16,9 @@ local HL = "Comment"
 local HINT_HL = "DiagnosticHint"
 local HAS_INLINE = vim.fn.has("nvim-0.10") == 1
 
-function M.namespace()
-  return ns
-end
+function M.namespace() return ns end
 
-function M.prediction_namespace()
-  return ns_pred
-end
+function M.prediction_namespace() return ns_pred end
 
 function M.clear(bufnr)
   -- diff mode paints many extmarks, so clear the whole namespace, not one id
@@ -38,9 +34,7 @@ function M.prediction(bufnr, row0, label)
   })
 end
 
-function M.clear_prediction(bufnr)
-  pcall(vim.api.nvim_buf_clear_namespace, bufnr or 0, ns_pred, 0, -1)
-end
+function M.clear_prediction(bufnr) pcall(vim.api.nvim_buf_clear_namespace, bufnr or 0, ns_pred, 0, -1) end
 
 -- Highlight groups: additions link to DiffAdd; deletions copy DiffDelete's
 -- colors and add strikethrough. Refreshed on colorscheme change.
@@ -90,12 +84,36 @@ function M.inline(bufnr, row0, col0, ghost)
     opts.virt_text = { { first, HL } }
     opts.virt_text_pos = (HAS_INLINE and first:find("%c") == nil) and "inline" or "eol"
   end
-  if #rest > 0 then
-    opts.virt_lines = rest
-  end
+  if #rest > 0 then opts.virt_lines = rest end
   vim.api.nvim_buf_set_extmark(bufnr, ns, row0, col0, opts)
   local nbuf = vim.api.nvim_buf_line_count(bufnr)
   if #rest > 0 and row0 >= nbuf - 1 then reveal_below(bufnr, row0, #rest) end
+end
+
+-- A one-line rewrite keeps unchanged characters visible in their original place.
+function M.characters(bufnr, row, old, new, hint)
+  M.clear(bufnr)
+  for _, c in ipairs(require("neocursor.text").patches(old, new)) do
+    if c.finish > c.start then
+      vim.api.nvim_buf_set_extmark(bufnr, ns, row, c.start, {
+        end_row = row,
+        end_col = c.finish,
+        hl_group = "NeocursorDelete",
+      })
+    end
+    if c.text ~= "" then
+      vim.api.nvim_buf_set_extmark(bufnr, ns, row, c.finish, {
+        virt_text = { { c.text, "NeocursorAdd" } },
+        virt_text_pos = "inline",
+      })
+    end
+  end
+  if hint then
+    vim.api.nvim_buf_set_extmark(bufnr, ns, row, 0, {
+      virt_text = { { "  ⟪neocursor · " .. hint .. "⟫", HINT_HL } },
+      virt_text_pos = "eol",
+    })
+  end
 end
 
 --- Diff overlay for edits that replace existing lines (overrides / rewrites).
@@ -104,8 +122,8 @@ end
 function M.diff(bufnr, start0, old_lines, new_lines, hint)
   M.clear(bufnr)
   local hunks = vim.diff(
-    table.concat(old_lines, "\n"),
-    table.concat(new_lines, "\n"),
+    #old_lines > 0 and table.concat(old_lines, "\n") .. "\n" or "",
+    #new_lines > 0 and table.concat(new_lines, "\n") .. "\n" or "",
     { result_type = "indices" }
   ) or {}
   local nbuf = vim.api.nvim_buf_line_count(bufnr)

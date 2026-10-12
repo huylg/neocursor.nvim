@@ -19,6 +19,8 @@ for line in sys.stdin:
         req = json.loads(line)
     except json.JSONDecodeError:
         continue
+    if req.get("op") == "cancel":
+        continue
     content = req.get("content") or ""
     # Last-line append: the edit starts on the line after EOF (start = n+1,
     # endInclusive = n). The client must draw it under the last line and let
