@@ -1213,8 +1213,9 @@ function schedule_request(keep)
   )
 end
 
--- Compatible typing updates the remaining edit locally. Unrelated changes
--- rebase its range; conflicting changes discard it and request a fresh edit.
+-- Typing the suggestion updates its remainder locally. Other edits change the
+-- user's intent/context and must request a fresh prediction, even when they
+-- do not overlap the old suggestion's range.
 local function try_retain()
   local s = state.suggestion
   if not s or vim.api.nvim_get_current_buf() ~= s.bufnr then return false end
@@ -1227,9 +1228,19 @@ local function try_retain()
   local oldrow = select(1, text_edit.position(s.snapshot, change.finish))
   local newrow = select(1, text_edit.position(current, change.start + #change.text))
   local delta = newrow - oldrow
-  local before_region = change.finish < first or (change.finish == first and change.text:sub(-1) == "\n")
-  local outside = before_region or (change.start >= finish and s.end0_excl < #before)
-  if not outside then
+  if s.mode == "inline" then
+    -- Edit distance also accepts subsequences (typing "a" into ghost "bar").
+    -- Inline continuation must consume the prefix at the displayed anchor,
+    -- leaving the existing text before and after that anchor untouched.
+    local anchor = text_edit.offset(before, s.ghost_row - 1, s.ghost_col)
+    local added = #current - #s.snapshot
+    if added <= 0 or added > #s.ghost then return false end
+    local expected = s.snapshot:sub(1, anchor) .. s.ghost:sub(1, added) .. s.snapshot:sub(anchor + 1)
+    if current ~= expected then return false end
+  else
+    local before_region = change.finish < first or (change.finish == first and change.text:sub(-1) == "\n")
+    local outside = before_region or (change.start >= finish and s.end0_excl < #before)
+    if outside then return false end
     local target = table.concat(text_edit.replace(before, s.start0, s.end0_excl, s.lines), "\n")
     if not text_edit.compatible(s.snapshot, current, target) then return false end
   end
@@ -1239,16 +1250,12 @@ local function try_retain()
       local e = q.list[k]
       if e.start0 >= oldrow + 1 then
         e.start0, e.end0_excl = e.start0 + delta, e.end0_excl + delta
-      elseif e == q.list[q.idx] and not outside then
+      elseif e == q.list[q.idx] then
         e.end0_excl = e.end0_excl + delta
       end
     end
   end
-  if before_region then
-    s.start0, s.end0_excl = s.start0 + delta, s.end0_excl + delta
-  elseif not outside then
-    s.end0_excl = s.end0_excl + delta
-  end
+  s.end0_excl = s.end0_excl + delta
   if s.request then
     s.request.expected = current
     s.request.transforms[#s.request.transforms + 1] =

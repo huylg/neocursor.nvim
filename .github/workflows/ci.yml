@@ -54,6 +54,9 @@ jobs:
       - name: stable previews and prepared jumps
         run: nvim --headless -u NONE -l test/smooth_spec.lua
 
+      - name: continue matching typing and refresh changed intent
+        run: nvim --headless -u NONE -c "luafile test/typing_spec.lua"
+
       - name: UTF-8 character edits
         run: nvim --headless -u NONE -l test/text_spec.lua
 

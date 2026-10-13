@@ -224,12 +224,12 @@ check("dismiss never undoes accepted edit", lines(), { "first", "inserted", "sec
 
 fresh("retain.py", { "foo(old_name)", "tail" })
 wait(nc.has_suggestion)
+local outside_requests = logs("REQ ")
 vim.api.nvim_buf_set_lines(0, 0, 0, false, { "new header" })
 pause(50)
-check("unrelated insertion rebases visible edit", nc.has_suggestion(), true)
-nc.accept()
-nc.accept()
-check("rebased edit preserves unrelated insertion", lines(), { "new header", "foo(new_name)", "tail" })
+check("unrelated insertion clears stale contextual edit", nc.has_suggestion(), false)
+check("unrelated insertion preserves user text", lines(), { "new header", "foo(old_name)", "tail" })
+check("unrelated insertion waits for configured debounce", logs("REQ "), outside_requests)
 pause(40)
 
 fresh("out_of_order.py", { "first", "second" })

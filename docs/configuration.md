@@ -48,6 +48,13 @@ An explicit value is authoritative. If omitted, neocursor adopts the server's
 `CppConfig` timing and uses 250 ms until configuration arrives or if it fails.
 Use a non-negative number of milliseconds.
 
+While a suggestion is visible, typing its inline prefix immediately removes
+those characters from the ghost text without a new request. Typing the whole
+suggestion advances its edit chain, or requests a continuation when the chain
+is exhausted. Other typing clears the old preview and requests a new prediction
+after this debounce, using the current buffer and cursor. This also applies when
+the old suggestion targets another line and you keep typing at the same cursor.
+
 ---
 
 ## `prefetch`

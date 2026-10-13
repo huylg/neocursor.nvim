@@ -22,7 +22,18 @@ def serve(req):
     def edit(index, text, start, end):
         event('edit', index=index, edit={'text': text, 'range': {'start': start, 'endInclusive': end}})
     time.sleep(.05)
-    if name == 'stream.py':
+    if name == 'typing_remote.py' and req['content'].split('\n')[0] == 'foo':
+        edit(1, 'TAIL', 2, 2)
+    elif name.startswith('typing'):
+        line = req['content'].split('\n')[req['line']]
+        # Neovim sends byte columns; preserve any suffix after the cursor.
+        raw = line.encode()
+        prefix, suffix = raw[:req['col']].decode(), raw[req['col']:].decode()
+        completion = '茶色' if name == 'typing_unicode.py' else 'bar'
+        if name == 'typing_multiline.py':
+            completion = '\nbar\nbaz'
+        edit(1, prefix + completion + suffix, req['line'] + 1, req['line'] + 1)
+    elif name == 'stream.py':
         edit(1, 'first\ninserted', 1, 1)
         time.sleep(.3)
         edit(1, 'first\ninserted', 1, 1)  # duplicate must never reapply
