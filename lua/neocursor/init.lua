@@ -2002,12 +2002,6 @@ function M.setup(opts)
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
   end, { desc = "neocursor diagnostics" })
 
-  vim.notify(
-    "neocursor ready — "
-      .. (state.cfg.normal_mode and "normal and insert modes" or "type in insert mode")
-      .. "; <Tab> accepts",
-    vim.log.levels.INFO
-  )
 end
 
 return M
